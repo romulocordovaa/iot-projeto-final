@@ -1,0 +1,193 @@
+#include <WiFi.h>
+#include "ThingSpeak.h"
+#include <OneWire.h>
+#include <DallasTemperature.h>
+
+// Definições das constantes
+const float ADC_RES = 4096.0;
+const float VREF = 5.0;
+
+// Pinos dos sensores
+struct Pins {
+    static const int TDS = 12;
+    static const int TEMP = 4;
+    static const int TURBIDITY = 27;
+};
+
+// Configurações de rede
+const char* WIFI_SSID = "123";
+const char* WIFI_PASS = "romulo123";
+const unsigned long CHANNEL_NUMBER = 1;
+const char* WRITE_API_KEY = "5OS2FHL2QZK8VK4Y";
+
+// Intervalos de tempo
+const unsigned long READING_INTERVAL = 30000;  // 30 segundos
+const unsigned long WIFI_TIMEOUT = 10000;      // 10 segundos para timeout do WiFi
+
+// Estrutura para armazenar as leituras
+struct WaterReadings {
+    float temperature;
+    float tds;
+    float turbidity;
+    float voltage;
+    bool isValid;
+};
+
+class WaterMonitor {
+private:
+    OneWire oneWire;
+    DallasTemperature tempSensor;
+    WiFiClient client;
+    unsigned long lastReadingTime;
+    
+    bool connectWiFi() {
+        Serial.print("Conectando ao WiFi");
+        unsigned long startAttemptTime = millis();
+        
+        while (WiFi.status() != WL_CONNECTED && 
+               millis() - startAttemptTime < WIFI_TIMEOUT) {
+            WiFi.begin(WIFI_SSID, WIFI_PASS);
+            delay(2000);
+            Serial.print(".");
+        }
+        
+        if (WiFi.status() == WL_CONNECTED) {
+            Serial.println("\nConectado!");
+            return true;
+        }
+        
+        Serial.println("\nFalha na conexão!");
+        return false;
+    }
+
+    float readTemperature() {
+        tempSensor.requestTemperatures();
+        float temp = tempSensor.getTempCByIndex(0);
+        return (temp != DEVICE_DISCONNECTED_C) ? temp : NAN;
+    }
+
+    float readTDS(float temperature) {
+        const int SAMPLES = 30;
+        int analogBuffer[SAMPLES];
+        float averageVoltage = 0;
+        
+        // Coleta múltiplas amostras
+        for (int i = 0; i < SAMPLES; i++) {
+            analogBuffer[i] = analogRead(Pins::TDS);
+            delay(10);
+        }
+        
+        // Calcula média usando mediana
+        averageVoltage = getMedianNum(analogBuffer, SAMPLES) * VREF / ADC_RES;
+        
+        // Compensação de temperatura
+        float compensationCoefficient = 1.0 + 0.02 * (temperature - 25.0);
+        float compensationVoltage = averageVoltage / compensationCoefficient;
+        
+        // Cálculo do TDS
+        return (133.42 * pow(compensationVoltage, 3) - 
+                255.86 * pow(compensationVoltage, 2) + 
+                857.39 * compensationVoltage) * 0.5;
+    }
+
+    float readTurbidity() {
+        const int SAMPLES = 10;
+        int sum = 0;
+        
+        // Média de várias leituras
+        for(int i = 0; i < SAMPLES; i++) {
+            sum += analogRead(Pins::TURBIDITY);
+            delay(10);
+        }
+        
+        int avgReading = sum / SAMPLES;
+        float voltage = avgReading * (VREF / ADC_RES);
+        return map(avgReading, 0, 750, 100, 0);
+    }
+
+public:
+    WaterMonitor() : oneWire(Pins::TEMP), 
+                     tempSensor(&oneWire), 
+                     lastReadingTime(0) {
+        WiFi.mode(WIFI_STA);
+        tempSensor.begin();
+        ThingSpeak.begin(client);
+    }
+
+    WaterReadings takeReadings() {
+        WaterReadings readings;
+        readings.isValid = false;
+        
+        // Realiza leituras
+        readings.temperature = readTemperature();
+        if (isnan(readings.temperature)) {
+            Serial.println("Erro na leitura da temperatura!");
+            return readings;
+        }
+        
+        readings.tds = readTDS(readings.temperature);
+        readings.turbidity = readTurbidity();
+        readings.voltage = analogRead(Pins::TURBIDITY) * (VREF / ADC_RES);
+        readings.isValid = true;
+        
+        return readings;
+    }
+
+    void sendToThingSpeak(const WaterReadings& readings) {
+        if (!readings.isValid) {
+            Serial.println("Dados inválidos, não enviando...");
+            return;
+        }
+
+        if (WiFi.status() != WL_CONNECTED && !connectWiFi()) {
+            Serial.println("Sem conexão WiFi, não é possível enviar dados");
+            return;
+        }
+
+        ThingSpeak.setField(1, readings.temperature);
+        ThingSpeak.setField(2, readings.tds);
+        ThingSpeak.setField(3, readings.turbidity);
+        ThingSpeak.setField(4, readings.voltage);
+
+        int response = ThingSpeak.writeFields(CHANNEL_NUMBER, WRITE_API_KEY);
+        if (response == 200) {
+            Serial.println("Dados enviados com sucesso!");
+        } else {
+            Serial.println("Erro ao enviar dados: " + String(response));
+        }
+    }
+
+    void printReadings(const WaterReadings& readings) {
+        if (!readings.isValid) {
+            Serial.println("Leituras inválidas!");
+            return;
+        }
+
+        Serial.println("------ Leituras ------");
+        Serial.printf("Temperatura: %.2f°C\n", readings.temperature);
+        Serial.printf("TDS: %.2f ppm\n", readings.tds);
+        Serial.printf("Turbidez: %.2f NTU\n", readings.turbidity);
+        Serial.printf("Voltage: %.2f V\n", readings.voltage);
+        Serial.println("--------------------");
+    }
+};
+
+WaterMonitor monitor;
+
+void setup() {
+    Serial.begin(115200);
+    pinMode(Pins::TDS, INPUT);
+    pinMode(Pins::TURBIDITY, INPUT);
+}
+
+void loop() {
+    static unsigned long lastReadingTime = 0;
+    unsigned long currentTime = millis();
+
+    if (currentTime - lastReadingTime >= READING_INTERVAL) {
+        WaterReadings readings = monitor.takeReadings();
+        monitor.printReadings(readings);
+        monitor.sendToThingSpeak(readings);
+        lastReadingTime = currentTime;
+    }
+}
